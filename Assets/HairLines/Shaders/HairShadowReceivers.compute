@@ -1,0 +1,83 @@
+#pragma kernel TileBounds
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+Texture2D<float> _HairReceiverDepth;
+
+float4x4 _HairReceiverInvViewProj;
+float4 _HairReceiverCamera;
+float4 _HairReceiverSize;
+
+struct ReceiverTile
+{
+    float3 lower;
+    float3 upper;
+};
+
+RWStructuredBuffer<ReceiverTile> _HairReceiverTiles;
+
+[numthreads(8, 8, 1)]
+void TileBounds(uint3 id : SV_DispatchThreadID)
+{
+    uint width = (uint)_HairReceiverSize.x;
+    uint height = (uint)_HairReceiverSize.y;
+    uint tile = max((uint)_HairReceiverSize.z, 1u);
+    uint tilesX = (uint)_HairReceiverSize.w;
+    uint tilesY = (height + tile - 1u) / tile;
+    if (id.x >= tilesX || id.y >= tilesY)
+        return;
+
+    ReceiverTile result;
+
+    uint textureWidth, textureHeight;
+    _HairReceiverDepth.GetDimensions(textureWidth, textureHeight);
+    if (textureWidth != width || textureHeight != height)
+    {
+        result.lower = -FLT_MAX;
+        result.upper = FLT_MAX;
+        _HairReceiverTiles[id.y * tilesX + id.x] = result;
+        return;
+    }
+
+    float reach = _HairReceiverCamera.w;
+    float reachSq = reach * reach;
+    float2 invSize = 1.0 / float2(width, height);
+
+    float3 lower = FLT_MAX;
+    float3 upper = -FLT_MAX;
+
+    uint x0 = id.x * tile;
+    uint y0 = id.y * tile;
+    uint x1 = min(x0 + tile, width);
+    uint y1 = min(y0 + tile, height);
+
+    [loop]
+    for (uint y = y0; y < y1; y++)
+    {
+        [loop]
+        for (uint x = x0; x < x1; x++)
+        {
+            float depth = _HairReceiverDepth.Load(int3(x, y, 0));
+            #if UNITY_REVERSED_Z
+                if (depth <= 0.0)
+                    continue;
+            #else
+                if (depth >= 1.0)
+                    continue;
+            #endif
+
+            float2 uv = (float2(x, y) + 0.5) * invSize;
+            float3 positionWS = ComputeWorldSpacePosition(uv, depth, _HairReceiverInvViewProj);
+            float3 fromCamera = positionWS - _HairReceiverCamera.xyz;
+            if (dot(fromCamera, fromCamera) >= reachSq)
+                continue;
+
+            lower = min(lower, positionWS);
+            upper = max(upper, positionWS);
+        }
+    }
+
+    result.lower = lower;
+    result.upper = upper;
+    _HairReceiverTiles[id.y * tilesX + id.x] = result;
+}

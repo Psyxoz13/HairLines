@@ -1,0 +1,346 @@
+#pragma kernel Initialize
+#pragma kernel SplatTriangles
+#pragma kernel Unflip
+#pragma kernel LinearFlood
+#pragma kernel LinearFloodDiagonal LinearFlood=LinearFloodDiagonal DIAGONAL_FLOOD
+#pragma kernel JumpFloodInitialize
+#pragma kernel JumpFlood
+#pragma kernel JumpFloodDiagonal JumpFlood=JumpFloodDiagonal DIAGONAL_FLOOD
+#pragma kernel JumpFloodFinalize
+#pragma kernel WriteTexture
+
+#define THREADS 64
+
+int _Resolution;
+uint _VoxelCount;
+float3 _FieldMinimum;
+float3 _CellSize;
+float _MaxDistance;
+float _InitialDistance;
+float _UnreachedDistance;
+
+ByteAddressBuffer _VertexBuffer;
+ByteAddressBuffer _IndexBuffer;
+uint _IndexFormat16;
+uint _VertexStride;
+uint _PositionOffset;
+uint _IndexStart;
+int _BaseVertex;
+uint _TriangleOffset;
+uint _TriangleCount;
+float4x4 _MeshToWorld;
+
+RWStructuredBuffer<uint> _SplatField;
+
+StructuredBuffer<float> _FieldRead;
+RWStructuredBuffer<float> _FieldWrite;
+
+StructuredBuffer<int> _JumpRead;
+RWStructuredBuffer<int> _JumpWrite;
+
+int _JumpOffset;
+int3 _JumpAxisOffset;
+
+RWTexture3D<half> _Distance;
+
+uint FloatFlip(float value)
+{
+    uint bits = asuint(value);
+    return (bits << 1) | (bits >> 31);
+}
+
+uint FloatUnflip(uint bits)
+{
+    return (bits >> 1) | (bits << 31);
+}
+
+int3 VoxelCoordinates(int index)
+{
+    int plane = _Resolution * _Resolution;
+    int z = index / plane;
+    int remainder = index % plane;
+    return int3(remainder % _Resolution, remainder / _Resolution, z);
+}
+
+int VoxelIndex(int3 coordinates)
+{
+    return (coordinates.z * _Resolution + coordinates.y) * _Resolution + coordinates.x;
+}
+
+float3 VoxelCentre(int3 coordinates)
+{
+    return _FieldMinimum + (float3(coordinates) + 0.5) * _CellSize;
+}
+
+int3 CellOf(float3 position)
+{
+    return (int3)floor((position - _FieldMinimum) / _CellSize);
+}
+
+uint TriangleIndex(uint i)
+{
+    if (_IndexFormat16 != 0u)
+    {
+        uint word = _IndexBuffer.Load((i >> 1u) << 2u);
+        return (i & 1u) != 0u ? (word >> 16u) & 0xffffu : word & 0xffffu;
+    }
+
+    return _IndexBuffer.Load(i << 2u);
+}
+
+float3 TrianglePosition(uint i)
+{
+    uint vertex = (uint)((int)TriangleIndex(i) + _BaseVertex);
+    float3 position = asfloat(_VertexBuffer.Load3(vertex * _VertexStride + _PositionOffset));
+    return mul(_MeshToWorld, float4(position, 1.0)).xyz;
+}
+
+float DistancePointToEdge(float3 p, float3 x0, float3 x1)
+{
+    if (x0.x > x1.x)
+    {
+        float3 swap = x0;
+        x0 = x1;
+        x1 = swap;
+    }
+
+    float3 x10 = x1 - x0;
+    float t = saturate(dot(x1 - p, x10) / dot(x10, x10));
+    return length(p - (t * x0 + (1.0 - t) * x1));
+}
+
+float SignedDistancePointToTriangle(float3 p, float3 x0, float3 x1, float3 x2)
+{
+    float3 x02 = x0 - x2;
+    float l0 = length(x02) + 1e-30;
+    x02 = x02 / l0;
+    float3 x12 = x1 - x2;
+    float l1 = dot(x12, x02);
+    x12 = x12 - l1 * x02;
+    float l2 = length(x12) + 1e-30;
+    x12 = x12 / l2;
+    float3 px2 = p - x2;
+
+    float b = dot(x12, px2) / l2;
+    float a = (dot(x02, px2) - l1 * b) / l0;
+    float c = 1.0 - a - b;
+
+    float3 normal = cross(x1 - x0, x2 - x0);
+    const float tolerance = 1e-8;
+
+    float d;
+    if (a >= -tolerance && b >= -tolerance && c >= -tolerance)
+    {
+        d = length(p - (a * x0 + b * x1 + c * x2));
+    }
+    else
+    {
+        d = min(DistancePointToEdge(p, x0, x1),
+                min(DistancePointToEdge(p, x1, x2), DistancePointToEdge(p, x0, x2)));
+    }
+
+    return dot(p - x0, normal) < 0.0 ? -d : d;
+}
+
+[numthreads(THREADS, 1, 1)]
+void Initialize(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelCount)
+        return;
+
+    _SplatField[id.x] = FloatFlip(_InitialDistance);
+}
+
+[numthreads(THREADS, 1, 1)]
+void SplatTriangles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TriangleCount)
+        return;
+
+    uint first = _IndexStart + (_TriangleOffset + id.x) * 3u;
+    float3 x0 = TrianglePosition(first);
+    float3 x1 = TrianglePosition(first + 1u);
+    float3 x2 = TrianglePosition(first + 2u);
+
+    float3 boxMinimum = min(x0, min(x1, x2)) - _CellSize;
+    float3 boxMaximum = max(x0, max(x1, x2)) + _CellSize;
+    int3 gridMinimum = clamp(CellOf(boxMinimum) - 1, 0, _Resolution - 1);
+    int3 gridMaximum = clamp(CellOf(boxMaximum) + 1, 0, _Resolution - 1);
+
+    [loop]
+    for (int z = gridMinimum.z; z <= gridMaximum.z; z++)
+    {
+        [loop]
+        for (int y = gridMinimum.y; y <= gridMaximum.y; y++)
+        {
+            [loop]
+            for (int x = gridMinimum.x; x <= gridMaximum.x; x++)
+            {
+                int3 cell = int3(x, y, z);
+                float distance = SignedDistancePointToTriangle(VoxelCentre(cell), x0, x1, x2);
+                InterlockedMin(_SplatField[(uint)VoxelIndex(cell)], FloatFlip(distance));
+            }
+        }
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void Unflip(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelCount)
+        return;
+
+    _SplatField[id.x] = FloatUnflip(_SplatField[id.x]);
+}
+
+float FieldAt(int3 coordinates)
+{
+    return _FieldRead[VoxelIndex(clamp(coordinates, 0, _Resolution - 1))];
+}
+
+float MinDistance(float current, float adjacent, float step)
+{
+    adjacent += adjacent < 0.0 ? -step : step;
+
+    if (adjacent > _MaxDistance)
+        return current;
+    if (current > _MaxDistance)
+        return adjacent;
+    return current < 0.0 ? max(adjacent, current) : min(adjacent, current);
+}
+
+void FloodFrom(int3 centre, int3 offset, inout float best)
+{
+    best = MinDistance(best, FieldAt(centre + offset), length(float3(offset) * _CellSize));
+}
+
+[numthreads(THREADS, 1, 1)]
+void LinearFlood(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelCount)
+        return;
+
+    float centreValue = _FieldRead[id.x];
+
+    if (abs(centreValue) < length(_CellSize))
+    {
+        _FieldWrite[id.x] = centreValue;
+        return;
+    }
+
+    int3 centre = VoxelCoordinates((int)id.x);
+    float best = centreValue;
+
+    FloodFrom(centre, int3( 1,  0,  0), best);
+    FloodFrom(centre, int3(-1,  0,  0), best);
+    FloodFrom(centre, int3( 0,  1,  0), best);
+    FloodFrom(centre, int3( 0, -1,  0), best);
+    FloodFrom(centre, int3( 0,  0,  1), best);
+    FloodFrom(centre, int3( 0,  0, -1), best);
+
+#ifdef DIAGONAL_FLOOD
+    [unroll]
+    for (int z = -1; z <= 1; z++)
+    {
+        [unroll]
+        for (int y = -1; y <= 1; y++)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++)
+            {
+                int3 offset = int3(x, y, z);
+                if (abs(x) + abs(y) + abs(z) >= 2)
+                {
+                    FloodFrom(centre, offset, best);
+                }
+            }
+        }
+    }
+#endif
+
+    _FieldWrite[id.x] = best;
+}
+
+[numthreads(THREADS, 1, 1)]
+void JumpFloodInitialize(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelCount)
+        return;
+
+    _JumpWrite[id.x] = abs(_FieldRead[id.x]) <= length(_CellSize) ? (int)id.x : -1;
+}
+
+void JumpSample(int3 centre, int3 offset, inout float bestDistance, inout int bestSeed)
+{
+    int seed = _JumpRead[VoxelIndex(clamp(centre + offset, 0, _Resolution - 1))];
+    if (seed < 0)
+        return;
+
+    float distance = length(float3(centre - VoxelCoordinates(seed)) * _CellSize);
+    if (distance < bestDistance)
+    {
+        bestDistance = distance;
+        bestSeed = seed;
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void JumpFlood(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelCount)
+        return;
+
+    int3 centre = VoxelCoordinates((int)id.x);
+    float bestDistance = 3.402823466e+38;
+    int bestSeed = -1;
+
+#ifdef DIAGONAL_FLOOD
+    [unroll]
+    for (int z = -1; z <= 1; z++)
+    {
+        [unroll]
+        for (int y = -1; y <= 1; y++)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++)
+            {
+                JumpSample(centre, int3(x, y, z) * _JumpOffset, bestDistance, bestSeed);
+            }
+        }
+    }
+#else
+    JumpSample(centre, int3(0, 0, 0), bestDistance, bestSeed);
+    JumpSample(centre, _JumpAxisOffset, bestDistance, bestSeed);
+    JumpSample(centre, -_JumpAxisOffset, bestDistance, bestSeed);
+#endif
+
+    _JumpWrite[id.x] = bestSeed;
+}
+
+[numthreads(THREADS, 1, 1)]
+void JumpFloodFinalize(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelCount)
+        return;
+
+    int seed = _JumpRead[id.x];
+    if (seed < 0)
+    {
+        _FieldWrite[id.x] = _MaxDistance;
+        return;
+    }
+
+    float seedDistance = _FieldRead[seed];
+    float toSeed = length(float3(VoxelCoordinates((int)id.x) - VoxelCoordinates(seed)) * _CellSize);
+    _FieldWrite[id.x] = toSeed * (seedDistance < 0.0 ? -1.0 : 1.0) + seedDistance;
+}
+
+[numthreads(THREADS, 1, 1)]
+void WriteTexture(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelCount)
+        return;
+
+    float distance = _FieldRead[id.x];
+    _Distance[(uint3)VoxelCoordinates((int)id.x)] = distance > _MaxDistance ? _UnreachedDistance : distance;
+}

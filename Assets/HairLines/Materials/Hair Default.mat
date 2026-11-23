@@ -1,0 +1,56 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: Hair Default
+  m_Shader: {fileID: 4800000, guid: 6902872227c0d4b429cae5e8e00009c8, type: 3}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords:
+  - _COLORSOURCE_RGB
+  - _SHADING_HAIR
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 1
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs: []
+    m_Ints: []
+    m_Floats:
+    - _Ambient: 1
+    - _ColorSource: 0
+    - _CuticleShift: 0.07
+    - _CuticleShiftVariation: 0.015
+    - _OpacityThreshold: 1
+    - _RimLight: 1.25
+    - _RootEumelanin: 0.03
+    - _RootPheomelanin: 0.26
+    - _RootShadow: 0.35
+    - _Roughness: 0.3
+    - _RoughnessVariation: 0.15
+    - _Scatter: 1.5
+    - _ScatterDepth: 6
+    - _Shading: 0
+    - _Specular: 1.35
+    - _StochasticOpacity: 0
+    - _TipEumelanin: 0.04
+    - _TipPheomelanin: 0.01
+    - _TipTaperLength: 0.1
+    - _TipWidth: 0.07
+    - _Transmission: 0.35
+    m_Colors:
+    - _ColorTint: {r: 2.9960785, g: 2.9960785, b: 2.9960785, a: 1}
+    - _RootColor: {r: 0.055, g: 0.03, b: 0.019, a: 1}
+    - _TipColor: {r: 0.115, g: 0.062, b: 0.035, a: 1}
+  m_BuildTextureStacks: []
+  m_AllowLocking: 1

@@ -1,0 +1,1984 @@
+#pragma kernel Reset
+#pragma kernel Predict
+#pragma kernel LimitStrain
+#pragma kernel ApplyInfluence
+#pragma kernel ProjectCollisions
+#pragma kernel Finalize
+#pragma kernel FinalizeGuides
+#pragma kernel ReduceBounds
+#pragma kernel FinalizeBounds
+#pragma kernel ResetResidual
+#pragma kernel MeasureResidual
+#pragma kernel XpbdResetLambdas
+#pragma kernel XpbdProjectEdges
+#pragma kernel XpbdGatherVertices
+#pragma kernel XpbdFusedLocal
+#pragma kernel CosseratFusedLocal
+#pragma kernel VolumeClear
+#pragma kernel VolumeSplat
+#pragma kernel VolumeResolve
+#pragma kernel VolumeDivergence
+#pragma kernel VolumePressure
+#pragma kernel VolumeGradient
+#pragma kernel PinTargets
+#pragma kernel ClearVelocity
+
+#define THREADS 256
+#define FLOAT_MAX 3.402823466e+38f
+
+RWStructuredBuffer<float3> _X;
+RWStructuredBuffer<float3> _V;
+RWStructuredBuffer<float3> _S;
+RWStructuredBuffer<float3> _XStart;
+StructuredBuffer<float> _SimulationInfluence;
+uint _SimulationInfluenceIsUnit;
+StructuredBuffer<uint> _VertexGroups;
+StructuredBuffer<uint> _StrandLocalIndex;
+StructuredBuffer<float> _RootDistance;
+StructuredBuffer<uint> _ControlIndices;
+StructuredBuffer<uint2> _InterpolationSlotAnchors;
+StructuredBuffer<float> _InterpolationT;
+uint _ControlCount;
+uint _StateCount;
+
+struct HairSimulationParameters
+{
+    float4 gravity;
+    float4 wind;
+    float4 compliance;
+    float4 solver;
+    float4 collision;
+    uint pinnedRootVertices;
+    uint reserved;
+    uint flags;
+    uint shapeOffset;
+    uint shapeCount;
+    uint substeps;
+    uint iterations;
+};
+
+StructuredBuffer<HairSimulationParameters> _SimulationParameters;
+
+RWStructuredBuffer<float3> _QCur;
+RWStructuredBuffer<float3> _QNext;
+
+RWStructuredBuffer<float4> _BoundsPartials;
+RWStructuredBuffer<float4> _BoundsResult;
+uint _BoundsGroupCount;
+RWStructuredBuffer<uint> _Residual;
+
+StructuredBuffer<float3> _RestLocal;
+StructuredBuffer<int2>   _StrandNeighbours;
+
+StructuredBuffer<uint>   _XpbdEdgeVertices;
+StructuredBuffer<float>  _XpbdEdgeRest;
+StructuredBuffer<uint>   _XpbdEdgeType;
+StructuredBuffer<uint>   _XpbdIncidentStart;
+StructuredBuffer<uint>   _XpbdIncidentEdges;
+RWStructuredBuffer<float>  _XpbdLambda;
+RWStructuredBuffer<float3> _XpbdDeltaA;
+RWStructuredBuffer<float3> _XpbdDeltaB;
+uint _XpbdEdgeCount;
+uint _XpbdEdgeOffset;
+
+RWStructuredBuffer<float4> _CosseratFrames;
+
+float4x4 _ObjectToWorld;
+
+#define SHAPE_SPHERE  0.0
+#define SHAPE_CAPSULE 1.0
+#define SHAPE_BOX     2.0
+
+float4 _ShapeA[128];
+float4 _ShapeB[128];
+float4 _ShapeRot[128];
+int    _ShapeCount;
+
+Texture3D<float> _SceneCollisionDistance;
+SamplerState sampler_SceneCollisionDistance;
+float3 _SceneCollisionMinimum;
+float3 _SceneCollisionInverseSize;
+float3 _SceneCollisionCellSize;
+uint _SceneCollisionValid;
+
+uint  _Count;
+float _FrameDelta;
+float _Time;
+uint _CurrentSubstep;
+uint _CurrentIteration;
+
+#define NO_PIN 0xffffffffu
+
+struct HairPinRecord
+{
+    uint4 slots;
+    float4 weights;
+    float3 bindPoint;
+    uint pin;
+};
+
+StructuredBuffer<uint> _VertexPin;
+StructuredBuffer<HairPinRecord> _PinRecords;
+StructuredBuffer<float4x4> _PinMatrices;
+StructuredBuffer<float> _PinCompliance;
+RWStructuredBuffer<float4> _PinTargets;
+StructuredBuffer<float4> _PinTargetsRead;
+RWStructuredBuffer<float> _PinLambda;
+uint _PinCount;
+
+float4 PinTarget(uint vertex)
+{
+    float4 target = float4(0.0, 0.0, 0.0, -1.0);
+    [branch] if (_PinCount != 0u)
+    {
+        uint pin = _VertexPin[vertex];
+        [branch] if (pin != NO_PIN)
+        {
+            target = _PinTargetsRead[pin];
+        }
+    }
+    return target;
+}
+
+float3 AttachmentCorrection(float3 position, float4 pin, float h, inout float lambda)
+{
+    float3 offset = position - pin.xyz;
+    float distance = length(offset);
+    float alphaTilde = pin.w / max(h * h, 1e-12);
+    float deltaLambda = (-distance - alphaTilde * lambda) / (1.0 + alphaTilde);
+    lambda += deltaLambda;
+    return distance > 1e-8 ? offset * (deltaLambda / distance) : 0.0;
+}
+
+uint ResolveControlVertex(uint dispatchIndex)
+{
+    return _ControlIndices[dispatchIndex];
+}
+
+uint ResolveFullVertex(uint stateIndex)
+{
+    return _ControlIndices[stateIndex];
+}
+
+float3 RestWorldPosition(uint index)
+{
+    return mul(_ObjectToWorld, float4(_RestLocal[index], 1.0)).xyz;
+}
+
+float3 EvaluateFinalPosition(uint vertex)
+{
+    uint2 anchors = _InterpolationSlotAnchors[vertex];
+    if (anchors.x == anchors.y)
+    {
+        uint state = anchors.x;
+        return _QCur[state];
+    }
+    float3 interpolated = lerp(_QCur[anchors.x], _QCur[anchors.y],
+                               saturate(_InterpolationT[vertex]));
+    if (_SimulationInfluenceIsUnit != 0u)
+    {
+        return interpolated;
+    }
+    float influence = saturate(_SimulationInfluence[vertex]);
+    if (influence >= 0.999)
+    {
+        return interpolated;
+    }
+    if (influence <= 0.001)
+    {
+        return RestWorldPosition(vertex);
+    }
+    return lerp(RestWorldPosition(vertex), interpolated, influence);
+}
+
+float3 QuatRotate(float4 q, float3 v)
+{
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+float3 QuatRotateInverse(float4 q, float3 v)
+{
+    return QuatRotate(float4(-q.xyz, q.w), v);
+}
+
+float RestWorldDistance(uint a, uint b)
+{
+    return length(mul(_ObjectToWorld, float4(_RestLocal[a] - _RestLocal[b], 0.0)).xyz);
+}
+
+float RestWorldArcDistance(uint a, uint b)
+{
+    uint first = min(a, b);
+    uint last = max(a, b);
+    float distance = 0.0;
+    [loop]
+    for (uint vertex = first; vertex < last; vertex++)
+    {
+        distance += RestWorldDistance(vertex, vertex + 1u);
+    }
+    return distance;
+}
+
+bool IsFiniteVector(float3 value)
+{
+    return all(value == value) && all(abs(value) < 1e20);
+}
+
+float3 PushOutOfSphere(float3 p, float3 centre, float radius)
+{
+    float3 d = p - centre;
+    float len = length(d);
+    if (!(radius > 0.0) || !(len < radius))
+        return p;
+
+    float3 direction = len > 1e-6 ? d / len : float3(0.0, 1.0, 0.0);
+    return centre + direction * radius;
+}
+
+float3 PushOutOfCapsule(float3 p, float3 a, float3 b, float radius)
+{
+    float3 ab = b - a;
+    float t = saturate(dot(p - a, ab) / max(dot(ab, ab), 1e-8));
+    return PushOutOfSphere(p, a + ab * t, radius);
+}
+
+float3 PushOutOfBox(float3 p, float3 centre, float4 rotation, float3 halfExtents, float padding)
+{
+    float3 local = QuatRotateInverse(rotation, p - centre);
+    float3 e = halfExtents + padding;
+    float3 a = abs(local);
+    float3 result = p;
+
+    if (a.x < e.x && a.y < e.y && a.z < e.z)
+    {
+        float3 penetration = e - a;
+        float3 s = float3(local.x < 0.0 ? -1.0 : 1.0,
+                          local.y < 0.0 ? -1.0 : 1.0,
+                          local.z < 0.0 ? -1.0 : 1.0);
+
+        if (penetration.x <= penetration.y && penetration.x <= penetration.z)
+            local.x = s.x * e.x;
+        else if (penetration.y <= penetration.z)
+            local.y = s.y * e.y;
+        else
+            local.z = s.z * e.z;
+
+        result = centre + QuatRotate(rotation, local);
+    }
+
+    return result;
+}
+
+bool IsInsideSceneCollisionField(float3 position)
+{
+    float3 uvw = (position - _SceneCollisionMinimum) * _SceneCollisionInverseSize;
+    return all(uvw >= 0.0) && all(uvw <= 1.0);
+}
+
+float SampleSceneCollisionDistance(float3 position)
+{
+    float3 uvw = (position - _SceneCollisionMinimum) * _SceneCollisionInverseSize;
+    return _SceneCollisionDistance.SampleLevel(sampler_SceneCollisionDistance, uvw, 0.0);
+}
+
+float3 SceneCollisionNormal(float3 position)
+{
+    float3 dx = float3(_SceneCollisionCellSize.x, 0.0, 0.0);
+    float3 dy = float3(0.0, _SceneCollisionCellSize.y, 0.0);
+    float3 dz = float3(0.0, 0.0, _SceneCollisionCellSize.z);
+    float3 gradient = float3(
+        SampleSceneCollisionDistance(position + dx) - SampleSceneCollisionDistance(position - dx),
+        SampleSceneCollisionDistance(position + dy) - SampleSceneCollisionDistance(position - dy),
+        SampleSceneCollisionDistance(position + dz) - SampleSceneCollisionDistance(position - dz));
+    float gradientLength = length(gradient);
+    float3 normal = float3(0.0, 1.0, 0.0);
+    if (gradientLength > 1e-6)
+    {
+        normal = gradient / gradientLength;
+    }
+    else
+    {
+        float3 fieldSize = 1.0 / max(_SceneCollisionInverseSize, 1e-8);
+        float3 fallback = position - (_SceneCollisionMinimum + fieldSize * 0.5);
+        float fallbackLength = length(fallback);
+        if (fallbackLength > 1e-6)
+        {
+            normal = fallback / fallbackLength;
+        }
+    }
+    return normal;
+}
+
+float3 PushOutOfSceneGeometry(float3 position, float clearance)
+{
+    float3 result = position;
+    if (_SceneCollisionValid == 0u || !IsInsideSceneCollisionField(position))
+    {
+        return result;
+    }
+
+    float distance = SampleSceneCollisionDistance(position);
+    if (distance != distance || abs(distance) > 1e20)
+    {
+        return result;
+    }
+    if (distance < clearance)
+    {
+        float3 normal = SceneCollisionNormal(position);
+        result = position + normal * (clearance - distance);
+    }
+    return result;
+}
+
+float3 SweepSceneGeometry(float3 previous, float3 candidate, float clearance)
+{
+    float3 movement = candidate - previous;
+    if (!IsFiniteVector(previous) || !IsFiniteVector(candidate) || !IsFiniteVector(movement))
+    {
+        return IsFiniteVector(previous) ? previous : 0.0;
+    }
+    float3 result = PushOutOfSceneGeometry(candidate, clearance);
+    float movementLength = length(movement);
+    if (_SceneCollisionValid == 0u || movementLength <= 1e-8 ||
+        movementLength != movementLength || movementLength > 1e20)
+    {
+        return result;
+    }
+
+    float3 direction = movement / movementLength;
+    float featureSize = min(_SceneCollisionCellSize.x,
+        min(_SceneCollisionCellSize.y, _SceneCollisionCellSize.z));
+    if (movementLength <= max(featureSize * 0.5, 1e-4))
+    {
+        return result;
+    }
+    float minimumStep = max(featureSize * 0.25, 1e-4);
+    float requestedSamples = ceil(movementLength / max(featureSize * 0.5, 1e-4));
+    uint sampleCount = requestedSamples >= 32.0 ? 32u :
+                       (requestedSamples <= 2.0 ? 2u : (uint)requestedSamples);
+    float travel = 0.0;
+
+    [loop]
+    for (uint step = 0u; step < sampleCount && travel <= movementLength; step++)
+    {
+        float3 probe = previous + direction * travel;
+        if (!IsInsideSceneCollisionField(probe))
+        {
+            travel += max(minimumStep, movementLength / (float)sampleCount);
+            continue;
+        }
+
+        float distance = SampleSceneCollisionDistance(probe);
+        if (distance != distance || abs(distance) > 1e20)
+        {
+            travel += max(minimumStep, movementLength / (float)sampleCount);
+            continue;
+        }
+        if (distance < clearance)
+        {
+            float3 normal = SceneCollisionNormal(probe);
+            float3 corrected = probe + normal * (clearance - distance);
+            float3 remaining = candidate - probe;
+            remaining -= normal * min(0.0, dot(remaining, normal));
+            result = PushOutOfSceneGeometry(corrected + remaining, clearance);
+            break;
+        }
+
+        travel += max(minimumStep, (distance - clearance) * 0.65);
+    }
+
+    return result;
+}
+
+float3 ResolveAnalyticCollisions(float3 p, uint group)
+{
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    uint end = min(parameters.shapeOffset + parameters.shapeCount, (uint)_ShapeCount);
+    for (uint i = parameters.shapeOffset; i < end; i++)
+    {
+        float type = _ShapeB[i].w;
+        if (type < 0.5)
+            p = PushOutOfSphere(p, _ShapeA[i].xyz, _ShapeA[i].w);
+        else if (type < 1.5)
+            p = PushOutOfCapsule(p, _ShapeA[i].xyz, _ShapeB[i].xyz, _ShapeA[i].w);
+        else
+            p = PushOutOfBox(p, _ShapeA[i].xyz, _ShapeRot[i], _ShapeB[i].xyz, _ShapeA[i].w);
+    }
+
+    return p;
+}
+
+float3 ResolveCollisions(float3 p, uint group)
+{
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    p = ResolveAnalyticCollisions(p, group);
+    if ((parameters.flags & 8u) != 0u)
+    {
+        p = PushOutOfSceneGeometry(p, parameters.collision.x);
+    }
+    return p;
+}
+
+float3 PushReconstructedOut(float3 p, uint vertex, uint group,
+                            HairSimulationParameters parameters)
+{
+    if (parameters.shapeCount == 0u)
+    {
+        return p;
+    }
+
+    float rootHold = parameters.collision.z;
+    float rootWeight = rootHold > 1e-6 ? saturate(_RootDistance[vertex] / rootHold) : 1.0;
+    if (rootWeight <= 0.0)
+    {
+        return p;
+    }
+
+    return p + (ResolveAnalyticCollisions(p, group) - p) * rootWeight;
+}
+
+float3 SweepToRestLength(float3 p, float3 previous, float3 rest, uint v)
+{
+    float restLength = RestWorldDistance(v, v - 1u);
+    float3 direction = p - previous;
+    float lengthSquared = dot(direction, direction);
+    if (lengthSquared > 1e-12)
+    {
+        direction *= rsqrt(lengthSquared);
+    }
+    else
+    {
+        float3 restDirection = rest - RestWorldPosition(v - 1u);
+        float restSquared = dot(restDirection, restDirection);
+        direction = restSquared > 1e-12
+            ? restDirection * rsqrt(restSquared)
+            : float3(0.0, 1.0, 0.0);
+    }
+
+    return previous + direction * restLength;
+}
+
+float AnalyticCollisionFeatureRadius(uint group, out uint hasCollider)
+{
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    uint begin = parameters.shapeOffset;
+    uint end = min(parameters.shapeOffset + parameters.shapeCount, (uint)_ShapeCount);
+    hasCollider = end > begin ? 1u : 0u;
+
+    float featureRadius = FLOAT_MAX;
+    bool foundFeature = false;
+    for (uint i = begin; i < end; i++)
+    {
+        float type = _ShapeB[i].w;
+        if (type < 1.5)
+        {
+            featureRadius = min(featureRadius, max(abs(_ShapeA[i].w), 1e-4));
+            foundFeature = true;
+        }
+        else
+        {
+            float3 halfExtents = abs(_ShapeB[i].xyz) + abs(_ShapeA[i].w);
+            float boxFeature = min(halfExtents.x, min(halfExtents.y, halfExtents.z));
+            featureRadius = min(featureRadius, max(boxFeature, 1e-4));
+            foundFeature = true;
+        }
+    }
+
+    if (!foundFeature)
+    {
+        featureRadius = max(parameters.collision.x, 1e-4);
+    }
+
+    return featureRadius;
+}
+
+float3 SweepAnalyticCollisions(float3 previous, float3 candidate, uint group)
+{
+    float3 movement = candidate - previous;
+    if (!IsFiniteVector(previous) || !IsFiniteVector(candidate) || !IsFiniteVector(movement))
+    {
+        return IsFiniteVector(previous) ? previous : 0.0;
+    }
+    float movementLength = length(movement);
+    float3 result = ResolveAnalyticCollisions(candidate, group);
+    if (movementLength <= 1e-8 || movementLength != movementLength || movementLength > 1e20)
+    {
+        return result;
+    }
+
+    uint hasCollider;
+    float featureRadius = AnalyticCollisionFeatureRadius(group, hasCollider);
+    if (hasCollider == 0u)
+    {
+        return result;
+    }
+
+    float sampleSpacing = max(featureRadius * 0.5, 1e-4);
+    float requestedSamples = ceil(movementLength / sampleSpacing);
+    if (movementLength <= featureRadius * 0.5)
+    {
+        return result;
+    }
+
+    uint sampleCount = requestedSamples >= 32.0 ? 32u :
+                       (requestedSamples <= 2.0 ? 2u : (uint)requestedSamples);
+    [loop]
+    for (uint sample = 0u; sample < sampleCount; sample++)
+    {
+        float t = (float)sample / (float)sampleCount;
+        float3 probe = previous + movement * t;
+        float3 corrected = ResolveAnalyticCollisions(probe, group);
+        float3 correction = corrected - probe;
+        if (dot(correction, correction) <= 1e-12)
+        {
+            continue;
+        }
+
+        float correctionLength = length(correction);
+        float3 normal = correction / max(correctionLength, 1e-8);
+        float3 remaining = candidate - probe;
+        remaining -= normal * min(0.0, dot(remaining, normal));
+        result = ResolveAnalyticCollisions(corrected + remaining, group);
+        break;
+    }
+    return result;
+}
+
+#define VOLUME_FIXED_POINT 4096.0
+#define VOLUME_MAX_SPEED 16.0
+
+uint _VolumeActive;
+uint _VolumeCellCount;
+uint _VolumePressureInit;
+float4x4 _WorldToObject;
+float4 _VolumeGrid;
+float4 _VolumeParameters;
+
+RWStructuredBuffer<int>    _VolumeAccumulator;
+StructuredBuffer<float>    _VolumeSplatWeight;
+RWStructuredBuffer<float4> _VolumeCells;
+StructuredBuffer<float4>   _VolumeCellsRead;
+RWStructuredBuffer<float>  _VolumeDivergence;
+StructuredBuffer<float>    _VolumeDivergenceRead;
+StructuredBuffer<float>    _VolumePressureRead;
+RWStructuredBuffer<float>  _VolumePressureNext;
+RWStructuredBuffer<float3> _VolumeGradient;
+StructuredBuffer<float3>   _VolumeGradientRead;
+
+uint VolumeResolution()
+{
+    return (uint)_VolumeParameters.x;
+}
+
+uint VolumeCellIndex(uint3 coordinate)
+{
+    uint resolution = VolumeResolution();
+    return (coordinate.z * resolution + coordinate.y) * resolution + coordinate.x;
+}
+
+uint3 VolumeCellCoordinate(uint cell)
+{
+    uint resolution = VolumeResolution();
+    return uint3(cell % resolution, (cell / resolution) % resolution, cell / (resolution * resolution));
+}
+
+uint VolumeNeighbour(uint3 coordinate, int3 step)
+{
+    int3 limit = (int)VolumeResolution() - 1;
+    return VolumeCellIndex((uint3)clamp((int3)coordinate + step, 0, limit));
+}
+
+float3 VolumeToGridAxes(float3 vectorWS)
+{
+    return mul((float3x3)_WorldToObject, vectorWS) * _VolumeParameters.w;
+}
+
+float3 VolumeFromGridAxes(float3 vectorGrid)
+{
+    return mul((float3x3)_ObjectToWorld, vectorGrid) / max(_VolumeParameters.w, 1e-8);
+}
+
+void VolumeStencil(float3 positionWS, out uint3 base, out float3 fraction)
+{
+    float resolution = _VolumeParameters.x;
+    float3 local = mul(_WorldToObject, float4(positionWS, 1.0)).xyz;
+    float3 cell = (local - _VolumeGrid.xyz) / max(_VolumeGrid.w, 1e-8) - 0.5;
+    float3 lower = clamp(floor(cell), 0.0, max(resolution - 2.0, 0.0));
+    base = (uint3)lower;
+    fraction = saturate(cell - lower);
+}
+
+float VolumeCornerWeight(float3 fraction, uint3 corner)
+{
+    float3 w = lerp(1.0 - fraction, fraction, (float3)corner);
+    return w.x * w.y * w.z;
+}
+
+bool SampleVolume(float3 positionWS, out float3 velocityWS, out float3 gradientWS)
+{
+    velocityWS = 0.0;
+    gradientWS = 0.0;
+    if (_VolumeActive == 0u || !IsFiniteVector(positionWS))
+    {
+        return false;
+    }
+
+    uint3 base;
+    float3 fraction;
+    VolumeStencil(positionWS, base, fraction);
+
+    float3 momentum = 0.0;
+    float3 gradient = 0.0;
+    float weight = 0.0;
+    [unroll]
+    for (uint corner = 0u; corner < 8u; corner++)
+    {
+        uint3 offset = uint3(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
+        uint cell = VolumeCellIndex(base + offset);
+        float t = VolumeCornerWeight(fraction, offset);
+        float4 data = _VolumeCellsRead[cell];
+        momentum += (t * data.w) * data.xyz;
+        weight += t * data.w;
+        gradient += t * _VolumeGradientRead[cell];
+    }
+
+    if (weight <= 1e-4)
+    {
+        return false;
+    }
+
+    velocityWS = VolumeFromGridAxes(momentum / weight);
+    gradientWS = VolumeFromGridAxes(gradient);
+    return true;
+}
+
+[numthreads(THREADS, 1, 1)]
+void Reset(uint3 id : SV_DispatchThreadID)
+{
+    uint state = id.x;
+    if (state >= _ControlCount) return;
+
+    uint i = ResolveFullVertex(state);
+    if (i >= _Count) return;
+
+    float3 p = mul(_ObjectToWorld, float4(_RestLocal[i], 1.0)).xyz;
+    [branch] if (_PinCount != 0u)
+    {
+        HairSimulationParameters parameters = _SimulationParameters[min(_VertexGroups[i], 15u)];
+        float4 pinned = PinTarget(i);
+        if ((parameters.flags & 4u) != 0u && _StrandLocalIndex[i] >= parameters.pinnedRootVertices &&
+            pinned.w == 0.0)
+        {
+            p = pinned.xyz;
+        }
+    }
+    _X[i] = p;
+    _S[state] = p;
+    _XStart[state] = p;
+    _QCur[state] = p;
+    _QNext[state] = p;
+    _V[state] = 0.0;
+    _CosseratFrames[state] = 0.0;
+}
+
+[numthreads(THREADS, 1, 1)]
+void Predict(uint3 id : SV_DispatchThreadID)
+{
+    uint state = id.x;
+    if (state >= _ControlCount) return;
+    uint i = ResolveControlVertex(state);
+    if (i >= _Count) return;
+
+    uint group = min(_VertexGroups[i], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    if ((parameters.flags & 4u) == 0u)
+    {
+        float3 rest = mul(_ObjectToWorld, float4(_RestLocal[i], 1.0)).xyz;
+        _X[i] = rest;
+        _XStart[state] = rest;
+        _S[state] = rest;
+        _QCur[state] = rest;
+        _V[state] = 0.0;
+        return;
+    }
+
+    if (_StrandLocalIndex[i] < parameters.pinnedRootVertices)
+    {
+        float3 rest = mul(_ObjectToWorld, float4(_RestLocal[i], 1.0)).xyz;
+        _X[i] = rest;
+        _XStart[state] = rest;
+        _S[state] = rest;
+        _QCur[state] = rest;
+        _V[state] = 0.0;
+        return;
+    }
+
+    float4 pinned = PinTarget(i);
+    if (pinned.w == 0.0)
+    {
+        _X[i] = pinned.xyz;
+        _XStart[state] = pinned.xyz;
+        _S[state] = pinned.xyz;
+        _QCur[state] = pinned.xyz;
+        _V[state] = 0.0;
+        return;
+    }
+
+    [branch] if (pinned.w > 0.0)
+    {
+        _PinLambda[_VertexPin[i]] = 0.0;
+    }
+
+    uint substeps = parameters.substeps;
+    float h = _FrameDelta / max(1u, substeps);
+    float3 x = _QCur[state];
+    if (_CurrentSubstep >= substeps)
+    {
+        return;
+    }
+
+    if (_CurrentSubstep > 0u)
+    {
+        float previousH = _FrameDelta / max(1u, substeps);
+        _V[state] = (x - _XStart[state]) / max(previousH, 1e-6);
+    }
+
+    float velocityDamping = pow(max(0.0, 1.0 - parameters.solver.x), h * 60.0);
+    float3 v = _V[state] * velocityDamping;
+
+    if (parameters.solver.y > 0.0 || parameters.solver.z > 0.0)
+    {
+        float3 volumeVelocity;
+        float3 pressureGradient;
+        if (SampleVolume(x, volumeVelocity, pressureGradient))
+        {
+            float blend = 1.0 - pow(max(0.0, 1.0 - saturate(parameters.solver.y)), h * 60.0);
+            v = lerp(v, volumeVelocity, blend);
+            v -= (saturate(parameters.solver.z) * h * 60.0) * pressureGradient;
+        }
+    }
+
+    float3 force = parameters.gravity.xyz + parameters.wind.xyz;
+    if (parameters.wind.w > 0.0)
+    {
+        force += parameters.wind.xyz * (parameters.wind.w * sin(dot(x, float3(11.3, 7.1, 9.7)) + _Time * 2.7));
+    }
+
+    float3 s = x + h * v + (h * h) * force;
+
+    _XStart[state] = x;
+    _S[state] = s;
+    _QCur[state] = s;
+}
+
+[numthreads(THREADS, 1, 1)]
+void XpbdResetLambdas(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _XpbdEdgeCount)
+    {
+        _XpbdLambda[_XpbdEdgeOffset + id.x] = 0.0;
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void XpbdProjectEdges(uint3 id : SV_DispatchThreadID)
+{
+    uint edge = _XpbdEdgeOffset + id.x;
+    if (id.x >= _XpbdEdgeCount)
+        return;
+
+    uint a = _XpbdEdgeVertices[edge * 2u];
+    uint b = _XpbdEdgeVertices[edge * 2u + 1u];
+    uint fullA = ResolveFullVertex(a);
+    uint fullB = ResolveFullVertex(b);
+    uint groupA = min(_VertexGroups[fullA], 15u);
+    uint groupB = min(_VertexGroups[fullB], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[groupA];
+    uint type = _XpbdEdgeType[edge];
+
+    bool iterationActive = _CurrentIteration < parameters.iterations;
+
+    bool enabled = groupA == groupB && (parameters.flags & 4u) != 0u &&
+                   _CurrentSubstep < parameters.substeps &&
+                   iterationActive;
+    if (type == 1u && (parameters.flags & 1u) == 0u)
+        enabled = false;
+
+    float compliance = type == 0u ? parameters.compliance.x : parameters.compliance.y;
+
+    if (!enabled)
+    {
+        _XpbdDeltaA[edge] = 0.0;
+        _XpbdDeltaB[edge] = 0.0;
+        return;
+    }
+
+    float3 qa = _QCur[a];
+    float3 qb = _QCur[b];
+    float3 difference = qa - qb;
+    float lengthCurrent = length(difference);
+    float3 gradient = lengthCurrent > 1e-8
+        ? difference / lengthCurrent
+        : float3(0.0, 1.0, 0.0);
+    float restLength = _XpbdEdgeRest[edge];
+    float constraint = lengthCurrent - restLength;
+
+    float inverseMassA = _StrandLocalIndex[fullA] < parameters.pinnedRootVertices ||
+                         PinTarget(fullA).w == 0.0 ? 0.0 : 1.0;
+    float inverseMassB = _StrandLocalIndex[fullB] < parameters.pinnedRootVertices ||
+                         PinTarget(fullB).w == 0.0 ? 0.0 : 1.0;
+    float h = _FrameDelta / max(1u, parameters.substeps);
+    float alphaTilde = max(0.0, compliance) / max(h * h, 1e-12);
+    float lambda = _XpbdLambda[edge];
+    float denominator = inverseMassA + inverseMassB + alphaTilde;
+    float deltaLambda = denominator > 1e-12
+        ? (-constraint - alphaTilde * lambda) / denominator
+        : 0.0;
+
+    uint degreeA = _XpbdIncidentStart[a + 1u] - _XpbdIncidentStart[a];
+    uint degreeB = _XpbdIncidentStart[b + 1u] - _XpbdIncidentStart[b];
+    float jacobiWeight = rcp((float)max(1u, max(degreeA, degreeB)));
+    deltaLambda *= jacobiWeight;
+
+    _XpbdLambda[edge] = lambda + deltaLambda;
+    _XpbdDeltaA[edge] = inverseMassA * deltaLambda * gradient;
+    _XpbdDeltaB[edge] = -inverseMassB * deltaLambda * gradient;
+}
+
+[numthreads(THREADS, 1, 1)]
+void XpbdGatherVertices(uint3 id : SV_DispatchThreadID)
+{
+    uint state = id.x;
+    if (state >= _ControlCount)
+        return;
+    uint vertex = ResolveControlVertex(state);
+
+    uint group = min(_VertexGroups[vertex], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    _QNext[state] = _QCur[state];
+
+    if ((parameters.flags & 4u) == 0u ||
+        _CurrentSubstep >= parameters.substeps ||
+        _CurrentIteration >= parameters.iterations)
+    {
+        return;
+    }
+
+    if (_StrandLocalIndex[vertex] < parameters.pinnedRootVertices)
+    {
+        _QNext[state] = RestWorldPosition(vertex);
+        return;
+    }
+
+    float4 pinned = PinTarget(vertex);
+    if (pinned.w == 0.0)
+    {
+        _QNext[state] = pinned.xyz;
+        return;
+    }
+
+    float3 correction = 0.0;
+    uint begin = _XpbdIncidentStart[state];
+    uint end = _XpbdIncidentStart[state + 1u];
+    for (uint item = begin; item < end; item++)
+    {
+        uint packed = _XpbdIncidentEdges[item];
+        uint edge = packed & 0x7FFFFFFFu;
+        correction += (packed & 0x80000000u) != 0u
+            ? _XpbdDeltaB[edge]
+            : _XpbdDeltaA[edge];
+    }
+
+    [branch] if (pinned.w > 0.0)
+    {
+        uint pin = _VertexPin[vertex];
+        float lambda = _PinLambda[pin];
+        correction += AttachmentCorrection(_QCur[state], pinned,
+                                           _FrameDelta / max(1u, parameters.substeps), lambda);
+        _PinLambda[pin] = lambda;
+    }
+
+    _QNext[state] = _QCur[state] + correction;
+}
+
+StructuredBuffer<int2>  _StrandRanges;
+uint  _StrandCount;
+
+StructuredBuffer<uint2>  _StrandVertexRanges;
+StructuredBuffer<uint2>  _GuideVertexRanges;
+StructuredBuffer<uint2>  _StrandGuideIds;
+StructuredBuffer<float2> _StrandGuideWeights;
+StructuredBuffer<uint>   _StrandGuideSelf;
+StructuredBuffer<float>  _VertexArcT;
+uint _GuideLengthSweep;
+
+#define INVALID_GUIDE 0xffffffffu
+
+#define FUSED_GROUP_LANES 64
+
+StructuredBuffer<uint>  _FusedStrandBase;
+StructuredBuffer<float> _FusedLocalRest;
+uint _FusedLanesPerStrand;
+uint _FusedStrandsPerGroup;
+uint _FusedIterations;
+
+groupshared float3 _FusedQ[FUSED_GROUP_LANES];
+groupshared float3 _FusedRestWorld[FUSED_GROUP_LANES];
+groupshared float  _FusedInverseMass[FUSED_GROUP_LANES];
+groupshared uint   _FusedDegree[FUSED_GROUP_LANES];
+groupshared float  _FusedLambdaStretch[FUSED_GROUP_LANES];
+groupshared float  _FusedLambdaBend[FUSED_GROUP_LANES];
+groupshared float  _FusedRestStretch[FUSED_GROUP_LANES];
+groupshared float  _FusedRestBend[FUSED_GROUP_LANES];
+groupshared float4 _FusedPin[FUSED_GROUP_LANES];
+groupshared float  _FusedLambdaPin[FUSED_GROUP_LANES];
+groupshared float3 _FusedCorrection[FUSED_GROUP_LANES * 4];
+
+void ProjectFusedEdge(uint indexA, uint indexB, uint cornerA, uint cornerB,
+                      float restLength, float compliance, float h,
+                      inout float lambda)
+{
+    float3 difference = _FusedQ[indexA] - _FusedQ[indexB];
+    float lengthCurrent = length(difference);
+    float3 gradient = lengthCurrent > 1e-8
+        ? difference / lengthCurrent
+        : float3(0.0, 1.0, 0.0);
+    float constraint = lengthCurrent - restLength;
+
+    float inverseMassA = _FusedInverseMass[indexA];
+    float inverseMassB = _FusedInverseMass[indexB];
+    float alphaTilde = max(0.0, compliance) / max(h * h, 1e-12);
+    float denominator = inverseMassA + inverseMassB + alphaTilde;
+    float deltaLambda = denominator > 1e-12
+        ? (-constraint - alphaTilde * lambda) / denominator
+        : 0.0;
+
+    float jacobiWeight = rcp((float)max(1u, max(_FusedDegree[indexA], _FusedDegree[indexB])));
+    deltaLambda *= jacobiWeight;
+
+    lambda += deltaLambda;
+    _FusedCorrection[indexA * 4u + cornerA] = inverseMassA * deltaLambda * gradient;
+    _FusedCorrection[indexB * 4u + cornerB] = -inverseMassB * deltaLambda * gradient;
+}
+
+[numthreads(FUSED_GROUP_LANES, 1, 1)]
+void XpbdFusedLocal(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint lane = groupThreadId.x;
+    uint lanesPerStrand = max(1u, _FusedLanesPerStrand);
+    uint strandInGroup = lane / lanesPerStrand;
+    uint localLane = lane - strandInGroup * lanesPerStrand;
+    uint strand = groupId.x * max(1u, _FusedStrandsPerGroup) + strandInGroup;
+    uint index = lane;
+
+    uint slotStart = 0u;
+    uint slotCount = 0u;
+    uint restBase = INVALID_GUIDE;
+    HairSimulationParameters parameters = _SimulationParameters[0];
+    bool active = false;
+
+    if (strand < _StrandCount)
+    {
+        int2 range = _StrandRanges[strand];
+        slotStart = (uint)max(0, range.x);
+        slotCount = (uint)max(0, range.y);
+        restBase = _FusedStrandBase[strand];
+        if (slotCount > 0u && slotCount <= lanesPerStrand && restBase != INVALID_GUIDE)
+        {
+            parameters = _SimulationParameters[min(_VertexGroups[_ControlIndices[slotStart]], 15u)];
+            active = (parameters.flags & 4u) != 0u && (parameters.flags & 16u) == 0u &&
+                     _CurrentSubstep < parameters.substeps;
+        }
+    }
+
+    bool ownsSlot = active && localLane < slotCount;
+    if (ownsSlot)
+    {
+        uint slot = slotStart + localLane;
+        uint full = _ControlIndices[slot];
+        float4 pinned = PinTarget(full);
+        bool heldExactly = pinned.w == 0.0;
+        _FusedQ[index] = _QCur[slot];
+        bool root = _StrandLocalIndex[full] < parameters.pinnedRootVertices;
+        _FusedRestWorld[index] = heldExactly && !root ? pinned.xyz : RestWorldPosition(full);
+        _FusedInverseMass[index] = root || heldExactly ? 0.0 : 1.0;
+        _FusedPin[index] = pinned;
+        _FusedLambdaPin[index] = 0.0;
+        _FusedDegree[index] = _XpbdIncidentStart[slot + 1u] - _XpbdIncidentStart[slot];
+        _FusedLambdaStretch[index] = 0.0;
+        _FusedLambdaBend[index] = 0.0;
+        _FusedRestStretch[index] = localLane + 1u < slotCount
+            ? _FusedLocalRest[restBase + localLane]
+            : -1.0;
+        _FusedRestBend[index] = localLane + 2u < slotCount
+            ? _FusedLocalRest[restBase + (slotCount - 1u) + localLane]
+            : -1.0;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    float h = _FrameDelta / max(1u, parameters.substeps);
+    bool bendEnabled = (parameters.flags & 1u) != 0u;
+
+    for (uint k = 0u; k < _FusedIterations; k++)
+    {
+        if (ownsSlot)
+        {
+            _FusedCorrection[index * 4u + 0u] = 0.0;
+            _FusedCorrection[index * 4u + 1u] = 0.0;
+            _FusedCorrection[index * 4u + 2u] = 0.0;
+            _FusedCorrection[index * 4u + 3u] = 0.0;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        bool iterate = ownsSlot && k < parameters.iterations;
+        if (iterate && _FusedRestStretch[index] >= 0.0)
+        {
+            float lambda = _FusedLambdaStretch[index];
+            ProjectFusedEdge(index, index + 1u, 0u, 1u, _FusedRestStretch[index],
+                             parameters.compliance.x, h, lambda);
+            _FusedLambdaStretch[index] = lambda;
+        }
+
+        if (iterate && bendEnabled && _FusedRestBend[index] >= 0.0)
+        {
+            float lambda = _FusedLambdaBend[index];
+            ProjectFusedEdge(index, index + 2u, 2u, 3u, _FusedRestBend[index],
+                             parameters.compliance.y, h, lambda);
+            _FusedLambdaBend[index] = lambda;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (iterate)
+        {
+            if (_FusedInverseMass[index] == 0.0)
+            {
+                _FusedQ[index] = _FusedRestWorld[index];
+            }
+            else
+            {
+                _FusedQ[index] += _FusedCorrection[index * 4u + 0u] +
+                                   _FusedCorrection[index * 4u + 1u] +
+                                   _FusedCorrection[index * 4u + 2u] +
+                                   _FusedCorrection[index * 4u + 3u];
+                if (_FusedPin[index].w > 0.0)
+                {
+                    float lambda = _FusedLambdaPin[index];
+                    _FusedQ[index] += AttachmentCorrection(_FusedQ[index], _FusedPin[index], h, lambda);
+                    _FusedLambdaPin[index] = lambda;
+                }
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (ownsSlot)
+    {
+        _QCur[slotStart + localLane] = _FusedQ[index];
+    }
+}
+
+static const float3 RodTangentAxis = float3(1.0, 0.0, 0.0);
+static const float3 RodNormalAxis = float3(0.0, 1.0, 0.0);
+
+groupshared float3 _RodX[FUSED_GROUP_LANES];
+groupshared float3 _RodInertia[FUSED_GROUP_LANES];
+groupshared float3 _RodRest[FUSED_GROUP_LANES];
+groupshared float  _RodInverseMass[FUSED_GROUP_LANES];
+groupshared float4 _RodQ[FUSED_GROUP_LANES];
+groupshared float4 _RodRestQ[FUSED_GROUP_LANES];
+groupshared float  _RodRestLength[FUSED_GROUP_LANES];
+groupshared float4 _RodPin[FUSED_GROUP_LANES];
+
+float4 QMul(float4 a, float4 b)
+{
+    return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+float4 QConjugate(float4 q)
+{
+    return float4(-q.xyz, q.w);
+}
+
+float4 QFromTo(float3 a, float3 b, float3 halfTurnAxis)
+{
+    float3 halfway = a + b;
+    float halfwaySquared = dot(halfway, halfway);
+    if (halfwaySquared <= 1e-12)
+    {
+        return float4(halfTurnAxis, 0.0);
+    }
+
+    halfway *= rsqrt(halfwaySquared);
+    return float4(cross(a, halfway), dot(a, halfway));
+}
+
+float3 AnyPerpendicular(float3 v)
+{
+    float3 axis = abs(v.x) < 0.9 ? float3(1.0, 0.0, 0.0) : float3(0.0, 1.0, 0.0);
+    return normalize(cross(v, axis));
+}
+
+float4 RodRootFrame(float3 tangent)
+{
+    float3 up = mul((float3x3)_ObjectToWorld, float3(0.0, 1.0, 0.0));
+    float3 right = mul((float3x3)_ObjectToWorld, float3(1.0, 0.0, 0.0));
+    float3 reference = abs(dot(tangent, normalize(up))) < 0.9 ? up : right;
+    float3 normal = normalize(reference - tangent * dot(reference, tangent));
+
+    float4 swing = QFromTo(RodTangentAxis, tangent, AnyPerpendicular(RodTangentAxis));
+    float4 twist = QFromTo(QuatRotate(swing, RodNormalAxis), normal, tangent);
+    return normalize(QMul(twist, swing));
+}
+
+float4 RodTransportFrame(float4 previous, float3 tangent)
+{
+    float3 previousTangent = QuatRotate(previous, RodTangentAxis);
+    float4 swing = QFromTo(previousTangent, tangent, QuatRotate(previous, RodNormalAxis));
+    return normalize(QMul(swing, previous));
+}
+
+[numthreads(FUSED_GROUP_LANES, 1, 1)]
+void CosseratFusedLocal(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint lane = groupThreadId.x;
+    uint lanesPerStrand = max(1u, _FusedLanesPerStrand);
+    uint strandInGroup = lane / lanesPerStrand;
+    uint localLane = lane - strandInGroup * lanesPerStrand;
+    uint strandBase = strandInGroup * lanesPerStrand;
+    uint strand = groupId.x * max(1u, _FusedStrandsPerGroup) + strandInGroup;
+    uint index = lane;
+
+    uint slotStart = 0u;
+    uint slotCount = 0u;
+    HairSimulationParameters parameters = _SimulationParameters[0];
+    bool active = false;
+
+    if (strand < _StrandCount)
+    {
+        int2 range = _StrandRanges[strand];
+        slotStart = (uint)max(0, range.x);
+        slotCount = (uint)max(0, range.y);
+        if (slotCount > 1u && slotCount <= lanesPerStrand)
+        {
+            parameters = _SimulationParameters[min(_VertexGroups[_ControlIndices[slotStart]], 15u)];
+            active = (parameters.flags & 4u) != 0u && (parameters.flags & 16u) != 0u &&
+                     _CurrentSubstep < parameters.substeps;
+        }
+    }
+
+    bool ownsSlot = active && localLane < slotCount;
+    uint pinnedVertices = parameters.pinnedRootVertices;
+    if (ownsSlot)
+    {
+        uint slot = slotStart + localLane;
+        uint full = _ControlIndices[slot];
+        float4 pinned = PinTarget(full);
+        _RodX[index] = _QCur[slot];
+        _RodInertia[index] = _S[slot];
+        _RodRest[index] = RestWorldPosition(full);
+        _RodInverseMass[index] = _StrandLocalIndex[full] < pinnedVertices || pinned.w == 0.0 ? 0.0 : 1.0;
+        _RodQ[index] = _CosseratFrames[slot];
+        _RodPin[index] = float4(pinned.xyz, pinned.w > 0.0 ? rcp(pinned.w) : 0.0);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (ownsSlot && localLane == 0u)
+    {
+        float4 restFrame = float4(0.0, 0.0, 0.0, 1.0);
+        float4 liveFrame = float4(0.0, 0.0, 0.0, 1.0);
+        for (uint j = 0u; j + 1u < slotCount; j++)
+        {
+            uint a = strandBase + j;
+            float3 restSegment = _RodRest[a + 1u] - _RodRest[a];
+            float restLength = length(restSegment);
+            float3 restTangent = restLength > 1e-8
+                ? restSegment / restLength
+                : (j == 0u ? RodNormalAxis : QuatRotate(restFrame, RodTangentAxis));
+            restFrame = j == 0u ? RodRootFrame(restTangent) : RodTransportFrame(restFrame, restTangent);
+            _RodRestQ[a] = restFrame;
+            _RodRestLength[a] = max(restLength, 1e-6);
+
+            float3 liveSegment = _RodX[a + 1u] - _RodX[a];
+            float liveLength = length(liveSegment);
+            float3 liveTangent = liveLength > 1e-8 ? liveSegment / liveLength : restTangent;
+            liveFrame = j == 0u ? restFrame : RodTransportFrame(liveFrame, liveTangent);
+
+            bool clamped = j == 0u || (_RodInverseMass[a] == 0.0 && _RodInverseMass[a + 1u] == 0.0);
+            if (clamped)
+            {
+                _RodQ[a] = j == 0u || j + 1u < pinnedVertices ? restFrame : liveFrame;
+            }
+            else if (dot(_RodQ[a], _RodQ[a]) < 0.5)
+            {
+                _RodQ[a] = liveFrame;
+            }
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    float h = _FrameDelta / max(1u, parameters.substeps);
+    float inertia = 1.0 / max(h * h, 1e-12);
+    float stretchStiffness = 1.0 / max(parameters.compliance.x, 1e-9);
+    float bendCompliance = max(parameters.compliance.y, 1e-9);
+    bool bendEnabled = (parameters.flags & 1u) != 0u;
+    bool hasSegment = localLane + 1u < slotCount;
+    bool clampedSegment = localLane == 0u ||
+                          (hasSegment && _RodInverseMass[index] == 0.0 && _RodInverseMass[index + 1u] == 0.0);
+
+    for (uint k = 0u; k < _FusedIterations; k++)
+    {
+        bool iterate = ownsSlot && k < parameters.iterations;
+
+        for (uint vertexColour = 0u; vertexColour < 2u; vertexColour++)
+        {
+            if (iterate && (localLane & 1u) == vertexColour && _RodInverseMass[index] > 0.0)
+            {
+                float3 x = _RodX[index];
+                float3 force = inertia * (_RodInertia[index] - x);
+                float hessian = inertia;
+
+                if (localLane > 0u)
+                {
+                    uint previous = index - 1u;
+                    float3 strain = x - _RodX[previous] -
+                        _RodRestLength[previous] * QuatRotate(_RodQ[previous], RodTangentAxis);
+                    force -= stretchStiffness * strain;
+                    hessian += stretchStiffness;
+                }
+
+                if (hasSegment)
+                {
+                    float3 strain = _RodX[index + 1u] - x -
+                        _RodRestLength[index] * QuatRotate(_RodQ[index], RodTangentAxis);
+                    force += stretchStiffness * strain;
+                    hessian += stretchStiffness;
+                }
+
+                float4 pinned = _RodPin[index];
+                if (pinned.w > 0.0)
+                {
+                    force += pinned.w * (pinned.xyz - x);
+                    hessian += pinned.w;
+                }
+
+                _RodX[index] = x + force / hessian;
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        for (uint segmentColour = 0u; segmentColour < 2u; segmentColour++)
+        {
+            if (iterate && hasSegment && !clampedSegment && (localLane & 1u) == segmentColour)
+            {
+                float restLength = _RodRestLength[index];
+                float4 q = _RodQ[index];
+                float3 v = (-2.0 * restLength * stretchStiffness) * (_RodX[index + 1u] - _RodX[index]);
+
+                float4 b = 0.0;
+                if (bendEnabled)
+                {
+                    if (localLane > 0u)
+                    {
+                        uint previous = index - 1u;
+                        float4 restDarboux = QMul(QConjugate(_RodRestQ[previous]), _RodRestQ[index]);
+                        float pole = dot(QMul(QConjugate(_RodQ[previous]), q), restDarboux) > 0.0 ? 1.0 : -1.0;
+                        float stiffness = _RodRestLength[previous] * restLength / bendCompliance;
+                        b += (stiffness * pole) * QMul(_RodQ[previous], restDarboux);
+                    }
+
+                    if (localLane + 2u < slotCount)
+                    {
+                        uint next = index + 1u;
+                        float4 restDarboux = QMul(QConjugate(_RodRestQ[index]), _RodRestQ[next]);
+                        float pole = dot(QMul(QConjugate(q), _RodQ[next]), restDarboux) > 0.0 ? 1.0 : -1.0;
+                        float stiffness = restLength * _RodRestLength[next] / bendCompliance;
+                        b += (stiffness * pole) * QMul(_RodQ[next], QConjugate(restDarboux));
+                    }
+                }
+
+                if (dot(b, b) > 1e-20)
+                {
+                    float lambda = length(v) + length(b);
+                    _RodQ[index] = normalize(QMul(QMul(float4(v, 0.0), b), float4(RodTangentAxis, 0.0)) +
+                                             lambda * b);
+                }
+                else if (dot(v, v) > 1e-20)
+                {
+                    _RodQ[index] = RodTransportFrame(q, normalize(-v));
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+
+    if (ownsSlot)
+    {
+        uint slot = slotStart + localLane;
+        _QCur[slot] = _RodX[index];
+        if (hasSegment)
+        {
+            _CosseratFrames[slot] = _RodQ[index];
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void LimitStrain(uint3 id : SV_DispatchThreadID)
+{
+    uint s = id.x;
+    if (s >= _StrandCount) return;
+
+    int2 range = _StrandRanges[s];
+    int start = range.x;
+    int count = range.y;
+    if (count <= 0)
+        return;
+    uint group = min(_VertexGroups[_ControlIndices[start]], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    if ((parameters.flags & 4u) == 0u)
+        return;
+    uint substeps = parameters.substeps;
+    if (_CurrentSubstep >= substeps || parameters.solver.w <= 1.0)
+        return;
+
+    int first = max(1, (int)parameters.pinnedRootVertices);
+
+    for (int i = first; i < count; i++)
+    {
+        uint aSlot = (uint)(start + i - 1);
+        uint bSlot = (uint)(start + i);
+        uint a = _ControlIndices[aSlot];
+        uint b = _ControlIndices[bSlot];
+        uint aState = aSlot;
+        uint bState = bSlot;
+        if (PinTarget(b).w == 0.0)
+            continue;
+
+        float3 pa = _X[aState];
+        float3 previous = _X[bState];
+        float3 delta = previous - pa;
+        float len = length(delta);
+        float maxLen = RestWorldArcDistance(a, b) * parameters.solver.w;
+
+        if (maxLen > 0.0 && len > maxLen && len > 1e-8)
+        {
+            float3 corrected = pa + delta * (maxLen / len);
+            _X[bState] = corrected;
+            float h = _FrameDelta / max(1u, parameters.substeps);
+            float3 normal = (corrected - previous) / max(length(corrected - previous), 1e-8);
+            float3 velocity = (previous - _XStart[bState]) / max(h, 1e-6);
+            velocity -= normal * min(0.0, dot(velocity, normal));
+            _XStart[bState] = corrected - velocity * h;
+        }
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void ApplyInfluence(uint3 id : SV_DispatchThreadID)
+{
+    uint state = id.x;
+    if (state >= _ControlCount)
+    {
+        return;
+    }
+    uint i = ResolveControlVertex(state);
+    if (i >= _Count)
+    {
+        return;
+    }
+
+    uint group = min(_VertexGroups[i], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    if ((parameters.flags & 4u) == 0u || _CurrentSubstep >= parameters.substeps ||
+        PinTarget(i).w == 0.0)
+    {
+        return;
+    }
+
+    float3 rest = RestWorldPosition(i);
+    float influence = saturate(_SimulationInfluence[i]);
+    float3 previous = _QCur[state];
+    float3 corrected = lerp(rest, previous, influence);
+    _QCur[state] = corrected;
+    _XStart[state] = lerp(rest, _XStart[state], influence);
+}
+
+[numthreads(THREADS, 1, 1)]
+void ProjectCollisions(uint3 id : SV_DispatchThreadID)
+{
+    uint state = id.x;
+    if (state >= _ControlCount)
+    {
+        return;
+    }
+    uint i = ResolveControlVertex(state);
+    if (i >= _Count)
+    {
+        return;
+    }
+
+    uint group = min(_VertexGroups[i], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    if ((parameters.flags & 4u) == 0u || _CurrentSubstep >= parameters.substeps)
+    {
+        return;
+    }
+
+    float rootHold = parameters.collision.z;
+    float rootWeight = rootHold > 1e-6 ? saturate(_RootDistance[i] / rootHold) : 1.0;
+    if (rootWeight <= 0.0 || PinTarget(i).w == 0.0)
+    {
+        return;
+    }
+
+    float3 position = _X[state];
+    if (!IsFiniteVector(position) || !IsFiniteVector(_XStart[state]))
+    {
+        _X[state] = IsFiniteVector(_XStart[state]) ? _XStart[state] : 0.0;
+        return;
+    }
+    float3 resolved = SweepAnalyticCollisions(_XStart[state], position, group);
+    if ((parameters.flags & 8u) != 0u)
+    {
+        resolved = SweepSceneGeometry(_XStart[state], resolved, parameters.collision.x);
+    }
+    float3 correction = (resolved - position) * rootWeight;
+    resolved = position + correction;
+    float correctionLength = length(correction);
+    if (correctionLength > 1e-7)
+    {
+        float h = _FrameDelta / max(1u, parameters.substeps);
+        float3 normal = correction / correctionLength;
+        float3 velocity = (position - _XStart[state]) / max(h, 1e-6);
+        velocity -= normal * min(0.0, dot(velocity, normal));
+        _XStart[state] = resolved - velocity * h;
+    }
+    _X[state] = resolved;
+}
+
+[numthreads(THREADS, 1, 1)]
+void Finalize(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _Count) return;
+
+    uint2 anchors = _InterpolationSlotAnchors[i];
+    uint state = anchors.x;
+
+    uint group = min(_VertexGroups[i], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    if ((parameters.flags & 4u) == 0u)
+    {
+        float3 rest = mul(_ObjectToWorld, float4(_RestLocal[i], 1.0)).xyz;
+        _X[i] = rest;
+        if (anchors.x == anchors.y)
+        {
+            _V[state] = 0.0;
+        }
+        return;
+    }
+    float h = max(_FrameDelta, 1e-6);
+
+    bool interpolated = anchors.x != anchors.y;
+    float3 q = EvaluateFinalPosition(i);
+    if (!interpolated)
+    {
+        float substepH = _FrameDelta / max(1u, parameters.substeps);
+        _V[state] = (q - _XStart[state]) / max(substepH, 1e-6);
+    }
+    else
+    {
+        q = PushReconstructedOut(q, i, group, parameters);
+    }
+
+    _X[i] = q;
+}
+
+float3 SolvedPosition(uint vertex)
+{
+    uint2 anchors = _InterpolationSlotAnchors[vertex];
+    if (anchors.x == anchors.y)
+    {
+        return _QCur[anchors.x];
+    }
+    return lerp(_QCur[anchors.x], _QCur[anchors.y], saturate(_InterpolationT[vertex]));
+}
+
+uint FindGuideSegment(uint start, uint count, float t)
+{
+    uint low = 0u;
+    uint high = count - 1u;
+    while (low + 1u < high)
+    {
+        uint mid = (low + high) >> 1u;
+        if (_VertexArcT[start + mid] <= t)
+        {
+            low = mid;
+        }
+        else
+        {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+void SampleGuide(uint guide, float t, out float3 solved, out float3 rest)
+{
+    solved = 0.0;
+    rest = 0.0;
+
+    uint2 range = _GuideVertexRanges[guide];
+    uint start = range.x;
+    uint count = range.y;
+    if (count <= 1u)
+    {
+        solved = SolvedPosition(start);
+        rest = RestWorldPosition(start);
+        return;
+    }
+
+    uint segment = FindGuideSegment(start, count, t);
+    uint a = start + segment;
+    uint b = a + 1u;
+    float arcA = _VertexArcT[a];
+    float span = _VertexArcT[b] - arcA;
+    float f = span > 1e-6 ? saturate((t - arcA) / span) : 0.0;
+    solved = lerp(SolvedPosition(a), SolvedPosition(b), f);
+    rest = lerp(RestWorldPosition(a), RestWorldPosition(b), f);
+}
+
+#define REACH_ITERATIONS 8
+
+float3 PlaceAtRestLength(float3 position, float3 anchor, float restLength)
+{
+    float3 direction = position - anchor;
+    float lengthSquared = dot(direction, direction);
+    direction = lengthSquared > 1e-12 ? direction * rsqrt(lengthSquared) : float3(0.0, -1.0, 0.0);
+    return anchor + direction * restLength;
+}
+
+void ReachBetweenHeldVertices(uint first, uint last, uint group, HairSimulationParameters parameters)
+{
+    float3 head = _X[first];
+    float3 tail = _X[last];
+    [loop]
+    for (uint iteration = 0u; iteration < REACH_ITERATIONS; iteration++)
+    {
+        float3 next = tail;
+        [loop]
+        for (uint back = last - 1u; back > first; back--)
+        {
+            next = PlaceAtRestLength(_X[back], next, RestWorldDistance(back, back + 1u));
+            _X[back] = next;
+        }
+
+        float3 previous = head;
+        [loop]
+        for (uint forward = first + 1u; forward < last; forward++)
+        {
+            previous = PlaceAtRestLength(_X[forward], previous, RestWorldDistance(forward, forward - 1u));
+            _X[forward] = previous;
+        }
+    }
+
+    [loop]
+    for (uint vertex = first + 1u; vertex < last; vertex++)
+    {
+        _X[vertex] = PushReconstructedOut(_X[vertex], vertex, group, parameters);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void FinalizeGuides(uint3 id : SV_DispatchThreadID)
+{
+    uint strand = id.x;
+    if (strand >= _StrandCount) return;
+
+    uint2 range = _StrandVertexRanges[strand];
+    uint start = range.x;
+    uint count = range.y;
+    if (count == 0u) return;
+
+    uint group = min(_VertexGroups[start], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    bool enabled = (parameters.flags & 4u) != 0u;
+    float substepH = _FrameDelta / max(1u, parameters.substeps);
+
+    if (_StrandGuideSelf[strand] != INVALID_GUIDE)
+    {
+        for (uint guideLocal = 0u; guideLocal < count; guideLocal++)
+        {
+            uint v = start + guideLocal;
+            uint2 anchors = _InterpolationSlotAnchors[v];
+            bool owns = anchors.x == anchors.y;
+            if (!enabled)
+            {
+                _X[v] = RestWorldPosition(v);
+                if (owns)
+                {
+                    _V[anchors.x] = 0.0;
+                }
+                continue;
+            }
+
+            float3 q = EvaluateFinalPosition(v);
+            if (owns)
+            {
+                _V[anchors.x] = (q - _XStart[anchors.x]) / max(substepH, 1e-6);
+            }
+            else
+            {
+                q = PushReconstructedOut(q, v, group, parameters);
+            }
+            _X[v] = q;
+        }
+        return;
+    }
+
+    uint2 guides = _StrandGuideIds[strand];
+    float2 weights = _StrandGuideWeights[strand];
+    float weightA = weights.x;
+    float weightB = weights.y;
+    if (guides.y == guides.x)
+    {
+        weightA += weightB;
+        weightB = 0.0;
+    }
+
+    uint pins = min(max(1u, parameters.pinnedRootVertices), count);
+    uint held = pins - 1u;
+    float3 previous = 0.0;
+
+    for (uint local = 0u; local < count; local++)
+    {
+        uint v = start + local;
+        float3 rest = RestWorldPosition(v);
+        float3 p = rest;
+
+        float4 pinned = enabled && local >= pins ? PinTarget(v) : float4(0.0, 0.0, 0.0, -1.0);
+        if (pinned.w == 0.0)
+        {
+            p = pinned.xyz;
+            _X[v] = p;
+            if (local > held + 1u)
+            {
+                ReachBetweenHeldVertices(start + held, v, group, parameters);
+            }
+            held = local;
+        }
+        else if (enabled && local >= pins)
+        {
+            float t = saturate(_VertexArcT[v]);
+            float3 solvedA, restA;
+            SampleGuide(guides.x, t, solvedA, restA);
+            float3 delta = weightA * (solvedA - restA);
+            if (weightB > 0.0)
+            {
+                float3 solvedB, restB;
+                SampleGuide(guides.y, t, solvedB, restB);
+                delta += weightB * (solvedB - restB);
+            }
+
+            float influence = _SimulationInfluenceIsUnit != 0u
+                ? 1.0
+                : saturate(_SimulationInfluence[v]);
+            p = rest + influence * delta;
+
+            bool sweeps = _GuideLengthSweep != 0u && local > 0u;
+            if (sweeps)
+            {
+                p = SweepToRestLength(p, previous, rest, v);
+            }
+
+            float3 pushed = PushReconstructedOut(p, v, group, parameters);
+            if (sweeps && any(pushed != p))
+            {
+                pushed = PushReconstructedOut(SweepToRestLength(pushed, previous, rest, v),
+                                              v, group, parameters);
+            }
+
+            p = pushed;
+        }
+
+        _X[v] = p;
+        previous = p;
+    }
+}
+
+groupshared float3 _BoundsMin[THREADS];
+groupshared float3 _BoundsMax[THREADS];
+
+[numthreads(THREADS, 1, 1)]
+void ReduceBounds(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID,
+                  uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint lane = groupThreadId.x;
+    float3 p = id.x < _Count ? _X[id.x] : float3(FLOAT_MAX, FLOAT_MAX, FLOAT_MAX);
+    _BoundsMin[lane] = p;
+    _BoundsMax[lane] = id.x < _Count
+        ? p
+        : float3(-FLOAT_MAX, -FLOAT_MAX, -FLOAT_MAX);
+
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+        {
+            _BoundsMin[lane] = min(_BoundsMin[lane], _BoundsMin[lane + stride]);
+            _BoundsMax[lane] = max(_BoundsMax[lane], _BoundsMax[lane + stride]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (lane == 0)
+    {
+        uint output = groupId.x * 2;
+        _BoundsPartials[output] = float4(_BoundsMin[0], 0.0);
+        _BoundsPartials[output + 1] = float4(_BoundsMax[0], 0.0);
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void FinalizeBounds(uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint lane = groupThreadId.x;
+    float3 minimum = float3(FLOAT_MAX, FLOAT_MAX, FLOAT_MAX);
+    float3 maximum = -minimum;
+
+    for (uint group = lane; group < _BoundsGroupCount; group += THREADS)
+    {
+        uint input = group * 2;
+        minimum = min(minimum, _BoundsPartials[input].xyz);
+        maximum = max(maximum, _BoundsPartials[input + 1].xyz);
+    }
+
+    _BoundsMin[lane] = minimum;
+    _BoundsMax[lane] = maximum;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (lane < stride)
+        {
+            _BoundsMin[lane] = min(_BoundsMin[lane], _BoundsMin[lane + stride]);
+            _BoundsMax[lane] = max(_BoundsMax[lane], _BoundsMax[lane + stride]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (lane == 0)
+    {
+        _BoundsResult[0] = float4(_BoundsMin[0], 0.0);
+        _BoundsResult[1] = float4(_BoundsMax[0], 0.0);
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ResetResidual(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x == 0u)
+    {
+        _Residual[0] = 0u;
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void MeasureResidual(uint3 id : SV_DispatchThreadID)
+{
+    uint edge = id.x;
+    if (edge >= _XpbdEdgeCount)
+    {
+        return;
+    }
+
+    uint a = _XpbdEdgeVertices[edge * 2u];
+    uint b = _XpbdEdgeVertices[edge * 2u + 1u];
+    uint fullA = ResolveFullVertex(a);
+    uint fullB = ResolveFullVertex(b);
+    uint group = min(_VertexGroups[fullA], 15u);
+    HairSimulationParameters parameters = _SimulationParameters[group];
+    if ((parameters.flags & 4u) == 0u || group != min(_VertexGroups[fullB], 15u))
+    {
+        return;
+    }
+
+    uint type = _XpbdEdgeType[edge];
+    if (type == 1u && (parameters.flags & 1u) == 0u)
+    {
+        return;
+    }
+
+    float compliance = type == 0u ? parameters.compliance.x : parameters.compliance.y;
+    if (compliance > 0.0)
+    {
+        return;
+    }
+
+    float restLength = max(_XpbdEdgeRest[edge], 1e-6);
+    float currentLength = length(_QCur[b] - _QCur[a]);
+    InterlockedMax(_Residual[0], asuint(abs(currentLength - restLength) / restLength));
+}
+
+[numthreads(THREADS, 1, 1)]
+void VolumeClear(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _VolumeCellCount * 4u)
+    {
+        _VolumeAccumulator[id.x] = 0;
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void VolumeSplat(uint3 id : SV_DispatchThreadID)
+{
+    uint state = id.x;
+    if (state >= _ControlCount)
+        return;
+
+    uint vertex = _ControlIndices[state];
+    HairSimulationParameters parameters = _SimulationParameters[min(_VertexGroups[vertex], 15u)];
+    if ((parameters.flags & 4u) == 0u || _StrandLocalIndex[vertex] < parameters.pinnedRootVertices)
+        return;
+
+    float weight = _VolumeSplatWeight[state];
+    float3 position = _QCur[state];
+    float3 velocity = _V[state];
+    if (!(weight > 0.0) || !IsFiniteVector(position) || !IsFiniteVector(velocity))
+        return;
+
+    float3 momentum = clamp(VolumeToGridAxes(velocity), -VOLUME_MAX_SPEED, VOLUME_MAX_SPEED);
+    uint3 base;
+    float3 fraction;
+    VolumeStencil(position, base, fraction);
+
+    [unroll]
+    for (uint corner = 0u; corner < 8u; corner++)
+    {
+        uint3 offset = uint3(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
+        uint slot = VolumeCellIndex(base + offset) * 4u;
+        float w = weight * VolumeCornerWeight(fraction, offset) * VOLUME_FIXED_POINT;
+        InterlockedAdd(_VolumeAccumulator[slot], (int)round(w));
+        InterlockedAdd(_VolumeAccumulator[slot + 1u], (int)round(w * momentum.x));
+        InterlockedAdd(_VolumeAccumulator[slot + 2u], (int)round(w * momentum.y));
+        InterlockedAdd(_VolumeAccumulator[slot + 3u], (int)round(w * momentum.z));
+    }
+}
+
+[numthreads(THREADS, 1, 1)]
+void VolumeResolve(uint3 id : SV_DispatchThreadID)
+{
+    uint cell = id.x;
+    if (cell >= _VolumeCellCount)
+        return;
+
+    uint slot = cell * 4u;
+    float weight = max(0.0, (float)_VolumeAccumulator[slot] / VOLUME_FIXED_POINT);
+    float3 momentum = float3(_VolumeAccumulator[slot + 1u], _VolumeAccumulator[slot + 2u],
+                             _VolumeAccumulator[slot + 3u]) / VOLUME_FIXED_POINT;
+    _VolumeCells[cell] = float4(weight > 1e-4 ? momentum / weight : 0.0, weight);
+}
+
+[numthreads(THREADS, 1, 1)]
+void VolumeDivergence(uint3 id : SV_DispatchThreadID)
+{
+    uint cell = id.x;
+    if (cell >= _VolumeCellCount)
+        return;
+
+    float4 centre = _VolumeCellsRead[cell];
+    if (centre.w <= 0.0)
+    {
+        _VolumeDivergence[cell] = 0.0;
+        return;
+    }
+
+    uint3 c = VolumeCellCoordinate(cell);
+    float divergence = (_VolumeCellsRead[VolumeNeighbour(c, int3(1, 0, 0))].x -
+                        _VolumeCellsRead[VolumeNeighbour(c, int3(-1, 0, 0))].x +
+                        _VolumeCellsRead[VolumeNeighbour(c, int3(0, 1, 0))].y -
+                        _VolumeCellsRead[VolumeNeighbour(c, int3(0, -1, 0))].y +
+                        _VolumeCellsRead[VolumeNeighbour(c, int3(0, 0, 1))].z -
+                        _VolumeCellsRead[VolumeNeighbour(c, int3(0, 0, -1))].z) /
+                       max(2.0 * _VolumeParameters.z, 1e-8);
+    float excess = centre.w * _VolumeParameters.y - 1.0;
+    _VolumeDivergence[cell] = min(0.0, divergence - excess);
+}
+
+[numthreads(THREADS, 1, 1)]
+void VolumePressure(uint3 id : SV_DispatchThreadID)
+{
+    uint cell = id.x;
+    if (cell >= _VolumeCellCount)
+        return;
+
+    float h = _VolumeParameters.z;
+    if (_VolumePressureInit != 0u)
+    {
+        float weight = _VolumeCellsRead[cell].w;
+        _VolumePressureNext[cell] = weight > 0.0
+            ? max(0.0, weight * _VolumeParameters.y - 1.0) * h * h
+            : 0.0;
+        return;
+    }
+
+    uint3 c = VolumeCellCoordinate(cell);
+    float neighbours = _VolumePressureRead[VolumeNeighbour(c, int3(1, 0, 0))] +
+                       _VolumePressureRead[VolumeNeighbour(c, int3(-1, 0, 0))] +
+                       _VolumePressureRead[VolumeNeighbour(c, int3(0, 1, 0))] +
+                       _VolumePressureRead[VolumeNeighbour(c, int3(0, -1, 0))] +
+                       _VolumePressureRead[VolumeNeighbour(c, int3(0, 0, 1))] +
+                       _VolumePressureRead[VolumeNeighbour(c, int3(0, 0, -1))];
+    _VolumePressureNext[cell] = (neighbours - h * h * _VolumeDivergenceRead[cell]) / 6.0;
+}
+
+[numthreads(THREADS, 1, 1)]
+void VolumeGradient(uint3 id : SV_DispatchThreadID)
+{
+    uint cell = id.x;
+    if (cell >= _VolumeCellCount)
+        return;
+
+    uint3 c = VolumeCellCoordinate(cell);
+    _VolumeGradient[cell] = float3(
+        _VolumePressureRead[VolumeNeighbour(c, int3(1, 0, 0))] - _VolumePressureRead[VolumeNeighbour(c, int3(-1, 0, 0))],
+        _VolumePressureRead[VolumeNeighbour(c, int3(0, 1, 0))] - _VolumePressureRead[VolumeNeighbour(c, int3(0, -1, 0))],
+        _VolumePressureRead[VolumeNeighbour(c, int3(0, 0, 1))] - _VolumePressureRead[VolumeNeighbour(c, int3(0, 0, -1))]) /
+        max(2.0 * _VolumeParameters.z, 1e-8);
+}
+
+[numthreads(THREADS, 1, 1)]
+void PinTargets(uint3 id : SV_DispatchThreadID)
+{
+    uint record = id.x;
+    if (record >= _PinCount)
+        return;
+
+    HairPinRecord pin = _PinRecords[record];
+    float4 bind = float4(pin.bindPoint, 1.0);
+    float3 target = pin.weights.x * mul(_PinMatrices[pin.slots.x], bind).xyz;
+    [branch] if (pin.weights.y > 0.0)
+    {
+        target += pin.weights.y * mul(_PinMatrices[pin.slots.y], bind).xyz;
+        target += pin.weights.z * mul(_PinMatrices[pin.slots.z], bind).xyz;
+        target += pin.weights.w * mul(_PinMatrices[pin.slots.w], bind).xyz;
+    }
+    _PinTargets[record] = float4(target, _PinCompliance[pin.pin]);
+}
+
+[numthreads(THREADS, 1, 1)]
+void ClearVelocity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _ControlCount)
+    {
+        _V[id.x] = 0.0;
+    }
+}

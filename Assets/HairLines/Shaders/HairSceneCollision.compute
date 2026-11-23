@@ -1,0 +1,171 @@
+#pragma kernel MarkSurface
+#pragma kernel JumpFlood
+#pragma kernel FinalizeDistance
+#pragma require inlineraytracing
+
+#include "UnityRayQuery.cginc"
+
+RaytracingAccelerationStructure _SceneAccelerationStructure;
+
+Texture3D<float4> _SeedRead;
+RWTexture3D<float4> _SeedWrite;
+RWTexture3D<float> _Inside;
+RWTexture3D<float> _Distance;
+
+uint _Resolution;
+uint _Jump;
+float3 _FieldMinimum;
+float3 _FieldSize;
+float3 _CellSize;
+float _MaximumTraceDistance;
+
+static const uint SceneRayFlags = RAY_FLAG_FORCE_OPAQUE;
+
+bool TraceScene(float3 origin, float3 direction, out float distance, out bool frontFace)
+{
+    UnityRayQuery<SceneRayFlags> query;
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = max(1e-5, min(_CellSize.x, min(_CellSize.y, _CellSize.z)) * 0.002);
+    ray.TMax = _MaximumTraceDistance;
+    query.TraceRayInline(_SceneAccelerationStructure, SceneRayFlags, 1u, ray);
+    while (query.Proceed())
+    {
+    }
+
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+    {
+        distance = _MaximumTraceDistance;
+        frontFace = true;
+        return false;
+    }
+
+    distance = query.CommittedRayT();
+    frontFace = query.CommittedTriangleFrontFace();
+    return true;
+}
+
+[numthreads(4, 4, 4)]
+void MarkSurface(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= uint3(_Resolution, _Resolution, _Resolution)))
+    {
+        return;
+    }
+
+    float3 position = _FieldMinimum + (float3(id) + 0.5) * _CellSize;
+    float3 directions[6] =
+    {
+        float3(1.0, 0.0, 0.0),
+        float3(-1.0, 0.0, 0.0),
+        float3(0.0, 1.0, 0.0),
+        float3(0.0, -1.0, 0.0),
+        float3(0.0, 0.0, 1.0),
+        float3(0.0, 0.0, -1.0)
+    };
+
+    float closestDistance = _MaximumTraceDistance;
+    float3 closestPoint = 0.0;
+    uint frontFaces = 0u;
+    uint backFaces = 0u;
+
+    [unroll]
+    for (uint directionIndex = 0u; directionIndex < 6u; directionIndex++)
+    {
+        float distance;
+        bool frontFace;
+        if (!TraceScene(position, directions[directionIndex], distance, frontFace))
+        {
+            continue;
+        }
+
+        if (frontFace)
+        {
+            frontFaces++;
+        }
+        else
+        {
+            backFaces++;
+        }
+
+        if (distance < closestDistance)
+        {
+            closestDistance = distance;
+            closestPoint = position + directions[directionIndex] * distance;
+        }
+    }
+
+    float surfaceBand = length(_CellSize) * 1.25;
+    _SeedWrite[id] = closestDistance <= surfaceBand
+        ? float4(closestPoint, 1.0)
+        : float4(0.0, 0.0, 0.0, 0.0);
+    _Inside[id] = backFaces >= 4u && backFaces > frontFaces ? 1.0 : 0.0;
+}
+
+[numthreads(4, 4, 4)]
+void JumpFlood(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= uint3(_Resolution, _Resolution, _Resolution)))
+    {
+        return;
+    }
+
+    int3 coordinate = int3(id);
+    float3 position = _FieldMinimum + (float3(id) + 0.5) * _CellSize;
+    float4 best = _SeedRead.Load(int4(coordinate, 0));
+    float bestDistanceSquared = best.w > 0.5
+        ? dot(best.xyz - position, best.xyz - position)
+        : 3.402823466e+38;
+
+    [unroll]
+    for (int z = -1; z <= 1; z++)
+    {
+        [unroll]
+        for (int y = -1; y <= 1; y++)
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++)
+            {
+                int3 sampleCoordinate = coordinate + int3(x, y, z) * int(_Jump);
+                if (any(sampleCoordinate < int3(0, 0, 0)) ||
+                    any(sampleCoordinate >= int3(_Resolution, _Resolution, _Resolution)))
+                {
+                    continue;
+                }
+
+                float4 candidate = _SeedRead.Load(int4(sampleCoordinate, 0));
+                if (candidate.w <= 0.5)
+                {
+                    continue;
+                }
+
+                float distanceSquared = dot(candidate.xyz - position, candidate.xyz - position);
+                if (distanceSquared < bestDistanceSquared)
+                {
+                    best = candidate;
+                    bestDistanceSquared = distanceSquared;
+                }
+            }
+        }
+    }
+
+    _SeedWrite[id] = best;
+}
+
+[numthreads(4, 4, 4)]
+void FinalizeDistance(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= uint3(_Resolution, _Resolution, _Resolution)))
+    {
+        return;
+    }
+
+    float3 position = _FieldMinimum + (float3(id) + 0.5) * _CellSize;
+    float4 seed = _SeedRead.Load(int4(id, 0));
+    float distance = seed.w > 0.5
+        ? max(0.0, length(seed.xyz - position) - length(_CellSize) * 0.75)
+        : length(_FieldSize);
+    float inside = _Inside[id];
+    _Distance[id] = inside > 0.5 ? -distance : distance;
+}

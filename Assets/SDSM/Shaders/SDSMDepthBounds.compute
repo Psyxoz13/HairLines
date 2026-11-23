@@ -1,0 +1,77 @@
+#pragma kernel TileRange
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+Texture2D<float> _SDSMDepth;
+
+float4x4 _SDSMInvViewProj;
+float4 _SDSMCamera;
+float4 _SDSMForward;
+float4 _SDSMSize;
+
+RWStructuredBuffer<float4> _SDSMTiles;
+
+[numthreads(8, 8, 1)]
+void TileRange(uint3 id : SV_DispatchThreadID)
+{
+    uint width = (uint)_SDSMSize.x;
+    uint height = (uint)_SDSMSize.y;
+    uint tile = max((uint)_SDSMSize.z, 1u);
+    uint tilesX = (uint)_SDSMSize.w;
+    uint tilesY = (height + tile - 1u) / tile;
+    if (id.x >= tilesX || id.y >= tilesY)
+        return;
+
+    uint textureWidth, textureHeight;
+    _SDSMDepth.GetDimensions(textureWidth, textureHeight);
+    if (textureWidth != width || textureHeight != height)
+    {
+        _SDSMTiles[id.y * tilesX + id.x] = float4(0.0, _SDSMCamera.w, _SDSMCamera.w, 1.0);
+        return;
+    }
+
+    float reachSq = _SDSMCamera.w * _SDSMCamera.w;
+    float2 invSize = 1.0 / float2(width, height);
+
+    float nearest = FLT_MAX;
+    float farthest = 0.0;
+    float farthestDistanceSq = 0.0;
+    float any = 0.0;
+
+    uint x0 = id.x * tile;
+    uint y0 = id.y * tile;
+    uint x1 = min(x0 + tile, width);
+    uint y1 = min(y0 + tile, height);
+
+    [loop]
+    for (uint y = y0; y < y1; y++)
+    {
+        [loop]
+        for (uint x = x0; x < x1; x++)
+        {
+            float depth = _SDSMDepth.Load(int3(x, y, 0));
+            #if UNITY_REVERSED_Z
+                if (depth <= 0.0)
+                    continue;
+            #else
+                if (depth >= 1.0)
+                    continue;
+            #endif
+
+            float2 uv = (float2(x, y) + 0.5) * invSize;
+            float3 positionWS = ComputeWorldSpacePosition(uv, depth, _SDSMInvViewProj);
+            float3 fromCamera = positionWS - _SDSMCamera.xyz;
+            float distanceSq = dot(fromCamera, fromCamera);
+            if (distanceSq >= reachSq)
+                continue;
+
+            float viewDepth = dot(fromCamera, _SDSMForward.xyz);
+            nearest = min(nearest, viewDepth);
+            farthest = max(farthest, viewDepth);
+            farthestDistanceSq = max(farthestDistanceSq, distanceSq);
+            any = 1.0;
+        }
+    }
+
+    _SDSMTiles[id.y * tilesX + id.x] = float4(nearest, farthest, sqrt(farthestDistanceSq), any);
+}

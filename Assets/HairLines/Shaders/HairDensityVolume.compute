@@ -1,0 +1,85 @@
+#pragma kernel Resolve
+#pragma kernel Downsample
+#pragma kernel SkyVisibility
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "HairDensityVolumeSampling.hlsl"
+
+float4 _HairVolumeSlab;
+
+Texture2DArray<float> _HairVolumeSplat;
+RWTexture3D<half>     _HairVolumeDensity;
+
+float4 _HairSplatResolve;
+
+[numthreads(4, 4, 4)]
+void Resolve(uint3 id : SV_DispatchThreadID)
+{
+    uint resolution = (uint)_HairSplatResolve.x;
+    if (any(id >= resolution))
+        return;
+
+    uint tiles = max((uint)_HairSplatResolve.y, 1u);
+    uint2 texel = uint2(id.z % tiles, id.z / tiles) * resolution + id.xy;
+    float metres = _HairVolumeSplat.Load(int4(texel, (int)_HairSplatResolve.z, 0));
+
+    uint3 at = uint3(id.x + (uint)_HairVolumeSlab.x, id.y, id.z + (uint)_HairVolumeSlab.z);
+    _HairVolumeDensity[at] = (half)(metres * _HairSplatResolve.w);
+}
+
+Texture3D<float>  _HairConeSourceTex;
+RWTexture3D<half> _HairVolumeCone;
+
+float4 _HairConeSource;
+float4 _HairConeTarget;
+
+[numthreads(4, 4, 4)]
+void Downsample(uint3 id : SV_DispatchThreadID)
+{
+    uint size = (uint)_HairConeTarget.w;
+    if (any(id >= size))
+        return;
+
+    uint3 corner = (uint3)_HairConeSource.xyz + id * 2u;
+    float sum = 0.0;
+
+    [unroll]
+    for (uint z = 0u; z < 2u; z++)
+    {
+        [unroll]
+        for (uint y = 0u; y < 2u; y++)
+        {
+            [unroll]
+            for (uint x = 0u; x < 2u; x++)
+            {
+                sum += _HairConeSourceTex[corner + uint3(x, y, z)];
+            }
+        }
+    }
+
+    _HairVolumeCone[(uint3)_HairConeTarget.xyz + id] = (half)(sum * 0.125);
+}
+
+RWTexture3D<half> _HairSkyVisibilityOut;
+
+float4 _HairSkyWeightsPos;
+float4 _HairSkyWeightsNeg;
+float4 _HairSkyGrid;
+
+[numthreads(4, 4, 4)]
+void SkyVisibility(uint3 id : SV_DispatchThreadID)
+{
+    uint grid = max((uint)_HairSkyGrid.x, 1u);
+    if (any(id >= grid))
+        return;
+
+    HairVolumeCaster volume = _HairVolumeCasters[(int)_HairSkyGrid.w];
+    float3 uvw01 = (float3(id) + 0.5) / grid;
+    float3 positionWS = volume.origin.xyz + uvw01 / max(volume.scale.xyz, 1e-6);
+
+    half visibility = HairVolumeSkyVisibilityTraced(positionWS, 0.5, _HairSkyWeightsPos.xyz,
+                                                    _HairSkyWeightsNeg.xyz, true);
+
+    uint3 at = uint3(id.x + (uint)_HairSkyGrid.y, id.y, id.z + (uint)_HairSkyGrid.z);
+    _HairSkyVisibilityOut[at] = visibility;
+}
